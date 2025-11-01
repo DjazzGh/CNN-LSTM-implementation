@@ -1,224 +1,272 @@
-# models/cnn_layers.py
 import numpy as np
-from utils.activations import relu, relu_prime
 
+def im2col(input_data, filter_h, filter_w, stride=1, pad=0):
+    """Converts an image into a column matrix. This is a common operation in CNNs
+    to efficiently perform convolution as a matrix multiplication.
 
-# ----------------------------------------------------------------------
-#  im2col / col2im utilities
-# ----------------------------------------------------------------------
-def im2col(x, f_h, f_w, stride, pad):
+    Args:
+        input_data (numpy.ndarray): Input data of shape (N, C, H, W)
+                                    N: batch size, C: channels, H: height, W: width.
+        filter_h (int): Height of the convolution filter.
+        filter_w (int): Width of the convolution filter.
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        pad (int, optional): Padding to apply to the input. Defaults to 0.
+
+    Returns:
+        numpy.ndarray: Column matrix of shape (N * out_h * out_w, C * filter_h * filter_w).
     """
-    Transform a 4‑D tensor into columns.
-    Input : (N, C, H, W)
-    Output: (N*OH*OW, C*f_h*f_w)
+    N, C, H, W = input_data.shape
+    out_h = (H + 2 * pad - filter_h) // stride + 1
+    out_w = (W + 2 * pad - filter_w) // stride + 1
+
+    img = np.pad(input_data, [(0, 0), (0, 0), (pad, pad), (pad, pad)], 'constant')
+    col = np.zeros((N, C, filter_h, filter_w, out_h, out_w))
+
+    for y in range(filter_h):
+        y_max = y + stride * out_h
+        for x in range(filter_w):
+            x_max = x + stride * out_w
+            col[:, :, y, x, :, :] = img[:, :, y:y_max:stride, x:x_max:stride]
+
+    col = col.transpose(0, 4, 5, 1, 2, 3).reshape(N * out_h * out_w, -1)
+    return col
+
+def col2im(col, input_shape, filter_h, filter_w, stride=1, pad=0):
+    """Converts a column matrix back into an image. This is used in the backward pass
+    of convolutional layers to propagate gradients.
+
+    Args:
+        col (numpy.ndarray): Column matrix of shape (N * out_h * out_w, C * filter_h * filter_w).
+        input_shape (tuple): Original input shape (N, C, H, W).
+        filter_h (int): Height of the convolution filter.
+        filter_w (int): Width of the convolution filter.
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        pad (int, optional): Padding applied to the input. Defaults to 0.
+
+    Returns:
+        numpy.ndarray: Image data of shape (N, C, H, W).
     """
-    N, C, H, W = x.shape
-    H_p = H + 2 * pad
-    W_p = W + 2 * pad
-    x_padded = np.pad(x,
-                      ((0, 0), (0, 0), (pad, pad), (pad, pad)),
-                      mode='constant')
+    N, C, H, W = input_shape
+    out_h = (H + 2 * pad - filter_h) // stride + 1
+    out_w = (W + 2 * pad - filter_w) // stride + 1
+    col = col.reshape(N, out_h, out_w, C, filter_h, filter_w).transpose(0, 3, 4, 5, 1, 2)
 
-    OH = (H_p - f_h) // stride + 1
-    OW = (W_p - f_w) // stride + 1
+    img = np.zeros((N, C, H + 2 * pad + stride - 1, W + 2 * pad + stride - 1))
+    for y in range(filter_h):
+        y_max = y + stride * out_h
+        for x in range(filter_w):
+            x_max = x + stride * out_w
+            img[:, :, y:y_max:stride, x:x_max:stride] += col[:, :, y, x, :, :]
 
-    cols = np.zeros((N * OH * OW, C * f_h * f_w), dtype=x.dtype)
-
-    idx = 0
-    for n in range(N):
-        for i in range(OH):
-            for j in range(OW):
-                patch = x_padded[
-                    n,
-                    :,
-                    i * stride : i * stride + f_h,
-                    j * stride : j * stride + f_w,
-                ]
-                cols[idx] = patch.ravel()
-                idx += 1
-    return cols, (N, C, H, W, OH, OW, stride, pad)
+    return img[:, :, pad:H + pad, pad:W + pad]
 
 
-def col2im(cols, shape_info, f_h, f_w):
-    """
-    Reverse of im2col.
-    """
-    N, C, H, W, OH, OW, stride, pad = shape_info
-    H_p = H + 2 * pad
-    W_p = W + 2 * pad
-    dx_padded = np.zeros((N, C, H_p, W_p), dtype=cols.dtype)
-
-    idx = 0
-    for n in range(N):
-        for i in range(OH):
-            for j in range(OW):
-                patch = cols[idx].reshape(C, f_h, f_w)
-                dx_padded[
-                    n,
-                    :,
-                    i * stride : i * stride + f_h,
-                    j * stride : j * stride + f_w,
-                ] += patch
-                idx += 1
-
-    # remove padding
-    if pad > 0:
-        dx = dx_padded[:, :, pad:-pad, pad:-pad]
-    else:
-        dx = dx_padded
-    return dx
-
-
-# ----------------------------------------------------------------------
-#  Conv2D
-# ----------------------------------------------------------------------
 class Conv2D:
-    def __init__(self, in_channels, out_channels, kernel_size,
-                 stride=1, pad=0):
-        k = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
-        limit = np.sqrt(6 / (in_channels * k * k))
-        self.W = np.random.uniform(-limit, limit,
-                                   (out_channels, in_channels, k, k))
-        self.b = np.zeros((out_channels, 1))
+    """A 2D Convolutional Layer.
 
+    Performs convolution operation on input data using learnable filters.
+    Supports forward and backward passes, and stores gradients for optimization.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, pad=0):
+        """Initializes the Conv2D layer.
+
+        Args:
+            in_channels (int): Number of channels in the input image.
+            out_channels (int): Number of filters (output channels) for the convolution.
+            kernel_size (int): Size of the convolutional kernel (assumed square).
+            stride (int, optional): Stride of the convolution. Defaults to 1.
+            pad (int, optional): Padding to apply to the input. Defaults to 0.
+        """
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
         self.stride = stride
         self.pad = pad
 
-        # caches
-        self.x_col = None
-        self.W_col = None
-        self.shape_info = None
-        self.x_padded = None
-        self.last_x = None          # for ReLU derivative
+        # Initialize weights and biases
+        # Weights are initialized using He initialization (Kaiming initialization)
+        # for ReLU activation functions, which helps in preventing vanishing/exploding gradients.
+        self.weights = np.random.randn(out_channels, in_channels, kernel_size, kernel_size) * np.sqrt(2. / (kernel_size * kernel_size * in_channels))
+        self.bias = np.zeros((out_channels, 1)) # Bias is initialized to zeros
 
-    def forward(self, x):
-        """
-        x : (N, C, H, W)
-        """
-        self.last_x = x
-        N, C, H, W = x.shape
-        F, _, HH, WW = self.W.shape
+        # Gradients
+        self.dweights = None
+        self.dbias = None
 
-        OH = (H + 2 * self.pad - HH) // self.stride + 1
-        OW = (W + 2 * self.pad - WW) // self.stride + 1
-
-        x_padded = np.pad(x,
-                          ((0, 0), (0, 0), (self.pad, self.pad), (self.pad, self.pad)),
-                          mode='constant')
-        self.x_padded = x_padded
-
-        self.x_col, self.shape_info = im2col(x_padded, HH, WW,
-                                            self.stride, 0)
-        self.W_col = self.W.reshape(F, -1)
-
-        pre_activation_out = self.x_col @ self.W_col.T + self.b.T          # (N*OH*OW, F)
-        out = pre_activation_out.reshape(N, OH, OW, F).transpose(0, 3, 1, 2) # (N, F, OH, OW)
-        self.last_pre_activation_out = pre_activation_out
-
-        self.out = relu(out)
-        return self.out
-
-    def backward(self, dout):
-        """
-        dout : (N, F, OH, OW)
-        Returns: dx, dW, db
-        """
-        N, F, OH, OW = dout.shape
-        
-        # ReLU derivative
-        d_relu = relu_prime(self.out) * dout
-        dout_flat = d_relu.transpose(0, 2, 3, 1).reshape(-1, F)   # (N*OH*OW, F)
-
-        # ---- gradients w.r.t. weights ----
-        dW = (dout_flat.T @ self.x_col).reshape(self.W.shape)
-        db = dout_flat.sum(axis=0, keepdims=True).T
-
-        # ---- gradient w.r.t. input ----
-        dx_col = dout_flat @ self.W_col                              # (N*OH*OW, C*HH*WW)
-        dx = col2im(dx_col, self.shape_info,
-                    self.W.shape[2], self.W.shape[3])                # (N, C, H, W)
-
-        self.grads = {'dW': dW, 'db': db}
-        return dx
-
-    def parameters(self):
-        return [self.W, self.b]
-
-    def grads(self):
-        return self.grads
-
-
-# ----------------------------------------------------------------------
-#  MaxPool2D
-# ----------------------------------------------------------------------
-class MaxPool2D:
-    def __init__(self, pool_size=2, stride=2):
-        self.pool = pool_size
-        self.stride = stride
-        self.last_x = None
-        self.mask = None          # stores indices of max elements
-
-    def forward(self, x):
-        N, C, H, W = x.shape
-
-        OH = H // self.pool
-        OW = W // self.pool
-
-        x_reshaped = x.reshape(N, C, OH, self.pool, OW, self.pool)
-        x_transposed = x_reshaped.transpose(0, 1, 2, 4, 3, 5)
-        x_flattened = x_transposed.reshape(N, C, OH, OW, self.pool * self.pool)
-
-        out = np.max(x_flattened, axis=4)
-        self.last_x_shape = x.shape
-
-        # Create mask for backward pass
-        self.mask = (x_flattened == out[..., np.newaxis])
-        return out
-
-    def backward(self, dout):
-        """
-        dout : (N, C, OH, OW)
-        """
-        N, C, OH, OW = dout.shape
-        dx = np.zeros(self.last_x_shape)
-
-        for n in range(N):
-            for c in range(C):
-                for i in range(OH):
-                    for j in range(OW):
-                        h_start = i * self.stride
-                        w_start = j * self.stride
-                        # Reshape dout to match the flattened patch shape
-                        d_patch = np.zeros((self.pool * self.pool,))
-                        d_patch[self.mask[n, c, i, j]] = dout[n, c, i, j]
-                        dx[n, c,
-                           h_start:h_start+self.pool,
-                           w_start:w_start+self.pool] += d_patch.reshape(self.pool, self.pool)
-        return dx
-
-    def parameters(self):
-        return []
-
-    def grads(self):
-        return {}
-
-
-# ----------------------------------------------------------------------
-#  Flatten
-# ----------------------------------------------------------------------
-class Flatten:
-    def __init__(self):
+        # Cache for backward pass
+        self.col = None
         self.input_shape = None
 
     def forward(self, x):
+        """Performs the forward pass of the Conv2D layer.
+
+        Args:
+            x (numpy.ndarray): Input data of shape (N, C, H, W).
+
+        Returns:
+            numpy.ndarray: Output feature map after convolution.
+        """
         self.input_shape = x.shape
+        N, C, H, W = x.shape
+        out_h = (H + 2 * self.pad - self.kernel_size) // self.stride + 1
+        out_w = (W + 2 * self.pad - self.kernel_size) // self.stride + 1
+
+        # Reshape input and weights for efficient matrix multiplication
+        col = im2col(x, self.kernel_size, self.kernel_size, self.stride, self.pad)
+        col_W = self.weights.reshape(self.out_channels, -1).T
+
+        # Perform convolution as matrix multiplication
+        out = np.dot(col, col_W) + self.bias.T
+        out = out.reshape(N, out_h, out_w, -1).transpose(0, 3, 1, 2)
+
+        self.col = col # Cache for backward pass
+        return out
+
+    def backward(self, dout):
+        """Performs the backward pass of the Conv2D layer.
+
+        Computes gradients with respect to weights, biases, and input data.
+
+        Args:
+            dout (numpy.ndarray): Gradient from the subsequent layer.
+
+        Returns:
+            numpy.ndarray: Gradient with respect to the input data.
+        """
+        N, C, H, W = self.input_shape
+        dout = dout.transpose(0, 2, 3, 1).reshape(-1, self.out_channels)
+
+        # Compute gradients for bias and weights
+        self.dbias = np.sum(dout, axis=0).reshape(self.out_channels, 1)
+        self.dweights = np.dot(self.col.T, dout).transpose(1, 0).reshape(
+            self.out_channels, self.in_channels, self.kernel_size, self.kernel_size)
+
+        # Compute gradient with respect to input data
+        dcol = np.dot(dout, self.weights.reshape(self.out_channels, -1))
+        dx = col2im(dcol, self.input_shape, self.kernel_size, self.kernel_size, self.stride, self.pad)
+        return dx
+
+    def parameters(self):
+        """Returns the learnable parameters of the layer.
+
+        Returns:
+            dict: A dictionary containing 'weights' and 'bias'.
+        """
+        return {'weights': self.weights, 'bias': self.bias}
+
+    def grads(self):
+        """Returns the gradients of the learnable parameters.
+
+        Returns:
+            dict: A dictionary containing 'dweights' and 'dbias'.
+        """
+        return {'dweights': self.dweights, 'dbias': self.dbias}
+
+
+class MaxPool2D:
+    """A 2D Max Pooling Layer.
+
+    Downsamples the input feature map by taking the maximum value within each pooling window.
+    """
+    def __init__(self, pool_size, stride=None):
+        """Initializes the MaxPool2D layer.
+
+        Args:
+            pool_size (int): Size of the pooling window (assumed square).
+            stride (int, optional): Stride of the pooling operation. Defaults to pool_size.
+        """
+        self.pool_size = pool_size
+        self.stride = stride if stride is not None else pool_size
+
+        # Cache for backward pass
+        self.x = None
+        self.arg_max = None
+
+    def forward(self, x):
+        """Performs the forward pass of the MaxPool2D layer.
+
+        Args:
+            x (numpy.ndarray): Input data of shape (N, C, H, W).
+
+        Returns:
+            numpy.ndarray: Output feature map after max pooling.
+        """
+        self.x = x
+        N, C, H, W = x.shape
+        out_h = (H - self.pool_size) // self.stride + 1
+        out_w = (W - self.pool_size) // self.stride + 1
+
+        # Reshape input for efficient pooling
+        col = im2col(x, self.pool_size, self.pool_size, self.stride, pad=0)
+        col = col.reshape(-1, self.pool_size * self.pool_size)
+
+        # Perform max pooling
+        arg_max = np.argmax(col, axis=1)
+        out = np.max(col, axis=1)
+        out = out.reshape(N, out_h, out_w, C).transpose(0, 3, 1, 2)
+
+        self.arg_max = arg_max # Cache for backward pass
+        return out
+
+    def backward(self, dout):
+        """Performs the backward pass of the MaxPool2D layer.
+
+        Propagates gradients by placing them at the positions of the maximum values
+        found during the forward pass.
+
+        Args:
+            dout (numpy.ndarray): Gradient from the subsequent layer.
+
+        Returns:
+            numpy.ndarray: Gradient with respect to the input data.
+        """
+        dout = dout.transpose(0, 2, 3, 1)
+
+        pool_size = self.pool_size * self.pool_size
+        dmax = np.zeros((dout.size, pool_size))
+        # Place gradients at the positions of the maximum values
+        dmax[np.arange(self.arg_max.size), self.arg_max.flatten()] = dout.flatten()
+        dmax = dmax.reshape(dout.shape + (pool_size,))
+
+        # Convert column matrix of gradients back to image shape
+        dx = col2im(dmax, self.x.shape, self.pool_size, self.pool_size, self.stride, pad=0)
+        return dx
+
+
+class Flatten:
+    """A Flatten Layer.
+
+    Reshapes the input tensor into a 2D tensor (batch_size, -1),
+    where -1 means the dimension is inferred from the other dimensions.
+    """
+    def __init__(self):
+        """Initializes the Flatten layer.
+        """
+        self.input_shape = None
+
+    def forward(self, x):
+        """Performs the forward pass of the Flatten layer.
+
+        Args:
+            x (numpy.ndarray): Input data of arbitrary shape.
+
+        Returns:
+            numpy.ndarray: Flattened output of shape (batch_size, -1).
+        """
+        self.input_shape = x.shape
+        # Reshape to (batch_size, -1) where -1 infers the dimension
         return x.reshape(x.shape[0], -1)
 
     def backward(self, dout):
+        """Performs the backward pass of the Flatten layer.
+
+        Reshapes the gradient back to the original input shape.
+
+        Args:
+            dout (numpy.ndarray): Gradient from the subsequent layer, shape (batch_size, -1).
+
+        Returns:
+            numpy.ndarray: Gradient reshaped to the original input shape.
+        """
+        # Reshape the gradient back to the original input shape
         return dout.reshape(self.input_shape)
-
-    def parameters(self):
-        return []
-
-    def grads(self):
-        return {}
