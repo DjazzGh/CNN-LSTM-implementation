@@ -64,7 +64,7 @@ class CNNLSTM:
         self.conv2.grads = {} # Clear previous gradients
 
         # Backpropagate through CNN layers for each time step
-        for t in reversed(range(self.x.shape[1])):
+        for t in reversed(range(self.T)):
             d_c = d_out_seq[:, t, :]
 
             d_pool2_out = self.flatten.backward(d_c)
